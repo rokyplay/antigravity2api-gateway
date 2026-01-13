@@ -5,11 +5,13 @@
 
 import { generateAssistantResponse, generateAssistantResponseNoStream } from '../../api/client.js';
 import { generateClaudeRequestBody, prepareImageRequest } from '../../utils/utils.js';
+import { cleanCacheControl } from '../../utils/messageCleaner.js';
 import { normalizeClaudeParameters } from '../../utils/parameterNormalizer.js';
 import { buildClaudeErrorPayload } from '../../utils/errors.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/config.js';
 import tokenManager from '../../auth/token_manager.js';
+import fs from 'fs';
 import {
   setStreamHeaders,
   createHeartbeat,
@@ -111,10 +113,32 @@ export const createClaudeResponse = (id, model, content, reasoning, reasoningSig
 export const handleClaudeRequest = async (req, res, isStream) => {
   const { messages, model, system, tools, ...rawParams } = req.body;
 
+  // 【调试】记录接收到的原始请求
+  try {
+    const incomingData = {
+      timestamp: new Date().toISOString(),
+      type: 'incoming_claude',
+      model,
+      isStream,
+      system: system?.substring?.(0, 200) || system,
+      toolsCount: tools?.length || 0,
+      messagesCount: messages?.length || 0,
+      rawParams,
+      messages,
+      tools
+    };
+    fs.writeFileSync('/app/data/debug-incoming.json', JSON.stringify(incomingData, null, 2));
+  } catch (e) {
+    console.error('写入 incoming 调试文件失败:', e.message);
+  }
+
   try {
     if (!messages) {
       return res.status(400).json(buildClaudeErrorPayload({ message: 'messages is required' }, 400));
     }
+
+    // 【预处理】清理消息中的 cache_control 字段（Claude prompt caching 功能，反重力不支持）
+    const cleanedMessages = cleanCacheControl(messages);
 
     const token = await tokenManager.getToken();
     if (!token) {
@@ -125,15 +149,27 @@ export const handleClaudeRequest = async (req, res, isStream) => {
     const parameters = normalizeClaudeParameters(rawParams);
 
     const isImageModel = model.includes('-image');
-    const requestBody = generateClaudeRequestBody(messages, model, parameters, tools, system, token);
 
-    if (isImageModel) {
-      prepareImageRequest(requestBody);
-    }
-    
+    // 【改进】创建请求体生成函数，支持重试时使用新 token
+    const createRequestBody = (t) => {
+      const body = generateClaudeRequestBody(cleanedMessages, model, parameters, tools, system, t);
+      if (isImageModel) {
+        prepareImageRequest(body);
+      }
+      return body;
+    };
+
+    const requestBody = createRequestBody(token);
+
     const msgId = `msg_${Date.now()}`;
     const maxRetries = Number(config.retryTimes || 0);
     const safeRetries = maxRetries > 0 ? Math.floor(maxRetries) : 0;
+
+    // 【改进】重试选项：支持重新获取 token
+    const retryOptions = {
+      currentToken: token,
+      getToken: () => tokenManager.getToken()
+    };
     
     if (isStream) {
       setStreamHeaders(res);
@@ -164,9 +200,13 @@ export const handleClaudeRequest = async (req, res, isStream) => {
         if (isImageModel) {
           // 生图模型：使用非流式获取结果后以流式格式返回
           const { content, usage } = await with429Retry(
-            () => generateAssistantResponseNoStream(requestBody, token),
+            (attempt, currentToken) => {
+              const body = attempt > 0 ? createRequestBody(currentToken) : requestBody;
+              return generateAssistantResponseNoStream(body, currentToken || token);
+            },
             safeRetries,
-            'claude.stream.image '
+            'claude.stream.image ',
+            retryOptions
           );
           
           // 发送文本块
@@ -201,7 +241,9 @@ export const handleClaudeRequest = async (req, res, isStream) => {
         }
         
         await with429Retry(
-          () => generateAssistantResponse(requestBody, token, (data) => {
+          (attempt, currentToken) => {
+            const body = attempt > 0 ? createRequestBody(currentToken) : requestBody;
+            return generateAssistantResponse(body, currentToken || token, (data) => {
             if (data.type === 'usage') {
               usageData = data.usage;
             } else if (data.type === 'reasoning') {
@@ -296,9 +338,11 @@ export const handleClaudeRequest = async (req, res, isStream) => {
                 delta: { type: "text_delta", text: data.content || '' }
               }));
             }
-          }),
+          });
+          },
           safeRetries,
-          'claude.stream '
+          'claude.stream ',
+          retryOptions
         );
         
         // 结束最后一个内容块
@@ -334,65 +378,19 @@ export const handleClaudeRequest = async (req, res, isStream) => {
         logger.error('Claude 流式请求失败:', error.message);
         return;
       }
-    } else if (config.fakeNonStream && !isImageModel) {
-      // 假非流模式：使用流式API获取数据，组装成非流式响应
-      req.setTimeout(0);
-      res.setTimeout(0);
-      
-      let content = '';
-      let reasoningContent = '';
-      let reasoningSignature = null;
-      const toolCalls = [];
-      let usageData = null;
-      
-      try {
-        await with429Retry(
-          () => generateAssistantResponse(requestBody, token, (data) => {
-            if (data.type === 'usage') {
-              usageData = data.usage;
-            } else if (data.type === 'reasoning') {
-              reasoningContent += data.reasoning_content || '';
-              if (data.thoughtSignature) {
-                reasoningSignature = data.thoughtSignature;
-              }
-            } else if (data.type === 'tool_calls') {
-              toolCalls.push(...data.tool_calls);
-            } else if (data.type === 'text') {
-              content += data.content || '';
-            }
-          }),
-          safeRetries,
-          'claude.fake_no_stream '
-        );
-        
-        const stopReason = toolCalls.length > 0 ? 'tool_use' : 'end_turn';
-        const response = createClaudeResponse(
-          msgId,
-          model,
-          content,
-          reasoningContent || null,
-          reasoningSignature,
-          toolCalls,
-          stopReason,
-          usageData
-        );
-        
-        res.json(response);
-      } catch (error) {
-        logger.error('Claude 假非流请求失败:', error.message);
-        if (res.headersSent) return;
-        const statusCode = error.statusCode || error.status || 500;
-        res.status(statusCode).json(buildClaudeErrorPayload(error, statusCode));
-      }
     } else {
       // 非流式请求
       req.setTimeout(0);
       res.setTimeout(0);
-      
+
       const { content, reasoningContent, reasoningSignature, toolCalls, usage } = await with429Retry(
-        () => generateAssistantResponseNoStream(requestBody, token),
+        (attempt, currentToken) => {
+          const body = attempt > 0 ? createRequestBody(currentToken) : requestBody;
+          return generateAssistantResponseNoStream(body, currentToken || token);
+        },
         safeRetries,
-        'claude.no_stream '
+        'claude.no_stream ',
+        retryOptions
       );
       
       const stopReason = toolCalls.length > 0 ? 'tool_use' : 'end_turn';

@@ -243,18 +243,24 @@ function computeBackoffMs(attempt, explicitDelayMs) {
 
 /**
  * 带 429 重试的执行器
- * @param {Function} fn - 要执行的异步函数，接收 attempt 参数
+ * 【改进】支持重试时重新获取 token，避免用同一个限流账号反复重试
+ * @param {Function} fn - 要执行的异步函数，接收 (attempt, token) 参数
  * @param {number} maxRetries - 最大重试次数
  * @param {string} loggerPrefix - 日志前缀
+ * @param {Object} options - 可选配置
+ * @param {Function} options.getToken - 获取 token 的函数（用于重试时重新获取）
+ * @param {Object} options.currentToken - 当前 token（首次使用）
  * @returns {Promise<any>}
  */
-export const with429Retry = async (fn, maxRetries, loggerPrefix = '') => {
+export const with429Retry = async (fn, maxRetries, loggerPrefix = '', options = {}) => {
   const retries = Number.isFinite(maxRetries) && maxRetries > 0 ? Math.floor(maxRetries) : 0;
   let attempt = 0;
+  let currentToken = options.currentToken || null;
+
   // 首次执行 + 最多 retries 次重试
   while (true) {
     try {
-      return await fn(attempt);
+      return await fn(attempt, currentToken);
     } catch (error) {
       // 兼容多种错误格式：error.status, error.statusCode, error.response?.status
       const status = Number(error.status || error.statusCode || error.response?.status);
@@ -268,6 +274,100 @@ export const with429Retry = async (fn, maxRetries, loggerPrefix = '') => {
         );
         await sleep(waitMs);
         attempt = nextAttempt;
+
+        // 【新增】重试时重新获取 token
+        if (options.getToken) {
+          try {
+            const newToken = await options.getToken();
+            if (newToken && newToken !== currentToken) {
+              logger.info(`${loggerPrefix}重试时切换到新账号`);
+              currentToken = newToken;
+            }
+          } catch (tokenError) {
+            logger.warn(`${loggerPrefix}重试时获取新 token 失败: ${tokenError.message}`);
+          }
+        }
+
+        continue;
+      }
+      throw error;
+    }
+  }
+};
+
+/**
+ * 带空回检测重试的流式执行器
+ * 【新增】当检测到响应为空时，自动重试而不是返回空响应
+ * @param {Function} fn - 要执行的流式函数，返回 { hasContent, hasToolCalls }
+ * @param {number} maxRetries - 最大重试次数
+ * @param {string} loggerPrefix - 日志前缀
+ * @param {Object} options - 可选配置
+ * @returns {Promise<Object>} 最终结果
+ */
+export const withEmptyRetry = async (fn, maxRetries, loggerPrefix = '', options = {}) => {
+  const retries = Number.isFinite(maxRetries) && maxRetries > 0 ? Math.floor(maxRetries) : 0;
+  let attempt = 0;
+  let currentToken = options.currentToken || null;
+
+  while (attempt <= retries) {
+    try {
+      const result = await fn(attempt, currentToken);
+
+      // 检测空回：没有内容、没有工具调用、没有思考内容
+      const isEmpty = !result.hasContent && !result.hasToolCalls && !result.hasReasoning;
+
+      if (isEmpty && attempt < retries) {
+        const nextAttempt = attempt + 1;
+        const waitMs = computeBackoffMs(nextAttempt, 1000); // 空回重试默认等待 1 秒
+        logger.warn(
+          `${loggerPrefix}检测到空回，等待 ${waitMs}ms 后进行第 ${nextAttempt} 次重试（共 ${retries} 次）`
+        );
+        await sleep(waitMs);
+        attempt = nextAttempt;
+
+        // 重试时重新获取 token
+        if (options.getToken) {
+          try {
+            const newToken = await options.getToken();
+            if (newToken && newToken !== currentToken) {
+              logger.info(`${loggerPrefix}空回重试时切换到新账号`);
+              currentToken = newToken;
+            }
+          } catch (tokenError) {
+            logger.warn(`${loggerPrefix}空回重试时获取新 token 失败: ${tokenError.message}`);
+          }
+        }
+
+        continue;
+      }
+
+      return result;
+    } catch (error) {
+      // 429 等错误：尝试重试
+      const status = Number(error.status || error.statusCode || error.response?.status);
+      if ((status === 429 || status === 503 || status === 529) && attempt < retries) {
+        const nextAttempt = attempt + 1;
+        const explicitDelayMs = getUpstreamRetryDelayMs(error);
+        const waitMs = computeBackoffMs(nextAttempt, explicitDelayMs);
+        logger.warn(
+          `${loggerPrefix}收到 ${status}，等待 ${waitMs}ms 后进行第 ${nextAttempt} 次重试（共 ${retries} 次）` +
+          (explicitDelayMs !== null ? `（上游提示≈${explicitDelayMs}ms）` : '')
+        );
+        await sleep(waitMs);
+        attempt = nextAttempt;
+
+        if (options.getToken) {
+          try {
+            const newToken = await options.getToken();
+            if (newToken && newToken !== currentToken) {
+              logger.info(`${loggerPrefix}错误重试时切换到新账号`);
+              currentToken = newToken;
+            }
+          } catch (tokenError) {
+            logger.warn(`${loggerPrefix}错误重试时获取新 token 失败: ${tokenError.message}`);
+          }
+        }
+
         continue;
       }
       throw error;

@@ -1,6 +1,6 @@
 // OpenAI 格式转换工具
 import config from '../../config/config.js';
-import { extractSystemInstruction } from '../utils.js';
+import { extractSystemInstruction, getThoughtSignatureForModel } from '../utils.js';
 import { convertOpenAIToolsToAntigravity } from '../toolConverter.js';
 import {
   getSignatureContext,
@@ -26,7 +26,8 @@ function extractImagesFromContent(content) {
   if (Array.isArray(content)) {
     for (const item of content) {
       if (item.type === 'text') {
-        result.text += item.text;
+        // 只提取 text 字段，忽略 cache_control 等其他字段
+        result.text += item.text || '';
       } else if (item.type === 'image_url') {
         const imageUrl = item.image_url?.url || '';
         const match = imageUrl.match(/^data:image\/(\w+);base64,(.+)$/);
@@ -64,7 +65,7 @@ function handleAssistantMessage(message, antigravityMessages, enableThinking, ac
     // 优先使用消息自带的思考内容，否则使用缓存的内容（与签名绑定）
     let reasoningText = ' ';
     let signature = null;
-    
+
     if (typeof message.reasoning_content === 'string' && message.reasoning_content.length > 0) {
       // 消息自带思考内容，使用消息自带的签名或缓存签名
       reasoningText = message.reasoning_content;
@@ -78,11 +79,15 @@ function handleAssistantMessage(message, antigravityMessages, enableThinking, ac
         reasoningText = toolContent || ' ';
       }
     }
-    
-    // 只有在有签名时才添加 thought part，避免 API 报错
-    if (signature) {
-      parts.push(createThoughtPart(reasoningText, signature));
+
+    // 【关键修复】thinking 模式必须有 thought part，没有签名就用兜底签名
+    if (!signature) {
+      signature = getThoughtSignatureForModel(actualModelName);
+      reasoningText = ' ';  // 兜底签名配空内容
     }
+
+    // 现在一定有签名，添加 thought part
+    parts.push(createThoughtPart(reasoningText, signature));
   }
   if (hasContent) {
     const part = { text: message.content.trimEnd() };
@@ -134,7 +139,7 @@ export function generateRequestBody(openaiMessages, modelName, parameters, opena
 
   const tools = convertOpenAIToolsToAntigravity(openaiTools, token.sessionId, actualModelName);
   const hasTools = tools && tools.length > 0;
-  //console.log(JSON.stringify(tools, null, 2))
+
   return buildRequestBody({
     contents: openaiMessageToAntigravity(filteredMessages, enableThinking, actualModelName, token.sessionId, hasTools),
     tools: tools,

@@ -12,6 +12,12 @@ import { deepMerge } from '../utils/deepMerge.js';
 import { getModelsWithQuotas } from '../api/client.js';
 import { getEnvPath } from '../utils/paths.js';
 import dotenv from 'dotenv';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs';
+import path from 'path';
+
+const execAsync = promisify(exec);
 
 const envPath = getEnvPath();
 
@@ -666,6 +672,91 @@ router.get('/tokens/:tokenId/quotas', cookieAuthMiddleware, async (req, res) => 
     });
   } catch (error) {
     logger.error('获取额度失败:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ==================== 版本切换 API ====================
+
+// 获取项目根目录（需要通过 volume 挂载）
+function getProjectRoot() {
+  return process.env.PROJECT_ROOT || '/project';
+}
+
+// 获取当前版本
+router.get('/version', cookieAuthMiddleware, (req, res) => {
+  try {
+    const projectRoot = getProjectRoot();
+    const versionFile = path.join(projectRoot, '.current_version');
+
+    let currentVersion = 'original';
+    if (fs.existsSync(versionFile)) {
+      currentVersion = fs.readFileSync(versionFile, 'utf8').trim();
+    }
+
+    res.json({
+      success: true,
+      data: {
+        current: currentVersion,
+        available: ['original', 'dev'],
+        descriptions: {
+          original: '原版 (upstream)',
+          dev: '开发版 (antiproxy_dev)'
+        }
+      }
+    });
+  } catch (error) {
+    logger.error('获取版本信息失败:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// 切换版本
+router.post('/version/switch', cookieAuthMiddleware, async (req, res) => {
+  try {
+    const { version } = req.body;
+
+    if (!version || !['original', 'dev'].includes(version)) {
+      return res.status(400).json({
+        success: false,
+        message: '无效的版本，可选值: original, dev'
+      });
+    }
+
+    const projectRoot = getProjectRoot();
+    const switchScript = path.join(projectRoot, 'switch-version.sh');
+
+    if (!fs.existsSync(switchScript)) {
+      return res.status(500).json({
+        success: false,
+        message: '切换脚本不存在。请在宿主机运行: ./switch-version.sh ' + version
+      });
+    }
+
+    logger.info(`开始切换版本到: ${version}`);
+
+    // 先返回响应，因为切换会重启服务
+    res.json({
+      success: true,
+      message: `正在切换到 ${version} 版本，服务将在几秒后重启...`,
+      data: { targetVersion: version }
+    });
+
+    // 延迟执行切换脚本
+    setTimeout(async () => {
+      try {
+        const { stdout, stderr } = await execAsync(`cd ${projectRoot} && ./switch-version.sh ${version}`, {
+          timeout: 120000  // 2分钟超时
+        });
+        logger.info('版本切换完成:', stdout);
+        if (stderr) logger.warn('切换警告:', stderr);
+      } catch (execError) {
+        logger.error('版本切换失败:', execError.message);
+      }
+    }, 500);
+
+  } catch (error) {
+    logger.error('版本切换失败:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 });

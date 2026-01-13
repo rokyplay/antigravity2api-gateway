@@ -3,6 +3,7 @@ import { generateToolCallId } from '../utils/idGenerator.js';
 import { setSignature, shouldCacheSignature, isImageModel } from '../utils/thoughtSignatureCache.js';
 import { getOriginalToolName } from '../utils/toolNameCache.js';
 import config from '../config/config.js';
+import fs from 'fs';
 
 // 预编译的常量（避免重复创建字符串）
 const DATA_PREFIX = 'data: ';
@@ -95,8 +96,52 @@ function parseAndEmitStreamChunk(line, state, callback) {
   
   try {
     const data = JSON.parse(line.slice(DATA_PREFIX_LEN));
-    const parts = data.response?.candidates?.[0]?.content?.parts;
-    
+    const candidate = data.response?.candidates?.[0];
+    const parts = candidate?.content?.parts;
+
+    // 【调试】记录响应中是否有 groundingMetadata
+    if (candidate) {
+      const debugPath = '/app/data/debug-response-chunk.json';
+      try {
+        const existing = fs.existsSync(debugPath) ? JSON.parse(fs.readFileSync(debugPath, 'utf8')) : { chunks: [] };
+        existing.chunks.push({
+          timestamp: new Date().toISOString(),
+          hasGroundingMetadata: !!candidate.groundingMetadata,
+          groundingMetadata: candidate.groundingMetadata || null,
+          finishReason: candidate.finishReason,
+          partsCount: parts?.length || 0
+        });
+        // 只保留最后 20 个 chunks
+        if (existing.chunks.length > 20) existing.chunks = existing.chunks.slice(-20);
+        fs.writeFileSync(debugPath, JSON.stringify(existing, null, 2));
+      } catch (e) { /* ignore */ }
+    }
+
+    // 处理 groundingMetadata（Google Search 工具的返回结果）
+    if (candidate?.groundingMetadata) {
+      const metadata = candidate.groundingMetadata;
+      // 转换为文本输出，包含搜索结果和来源
+      let searchResultText = '';
+
+      if (metadata.webSearchQueries?.length > 0) {
+        searchResultText += `搜索查询: ${metadata.webSearchQueries.join(', ')}\n\n`;
+      }
+
+      if (metadata.groundingChunks?.length > 0) {
+        searchResultText += '搜索结果:\n';
+        for (const chunk of metadata.groundingChunks) {
+          if (chunk.web) {
+            searchResultText += `- [${chunk.web.title || 'Link'}](${chunk.web.uri})\n`;
+          }
+        }
+        searchResultText += '\n';
+      }
+
+      if (searchResultText) {
+        callback({ type: 'text', content: searchResultText });
+      }
+    }
+
     if (parts) {
       for (const part of parts) {
         if (part.thoughtSignature) {
@@ -138,7 +183,7 @@ function parseAndEmitStreamChunk(line, state, callback) {
       }
     }
     
-    if (data.response?.candidates?.[0]?.finishReason) {
+    if (candidate?.finishReason) {
       // 流结束时，判断是否应该缓存签名
       const hasTools = state.hasToolCalls || state.toolCalls.length > 0;
       const isImage = isImageModel(state.model);

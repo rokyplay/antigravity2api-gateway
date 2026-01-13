@@ -58,12 +58,12 @@ function storeLog(level, message) {
 
 function logMessage(level, ...args) {
   const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  const color = { info: colors.green, warn: colors.yellow, error: colors.red }[level];
+  const color = { info: colors.green, warn: colors.yellow, error: colors.red, debug: colors.gray }[level];
   const message = formatArgs(args);
-  
+
   // 输出到控制台
   console.log(`${colors.gray}${timestamp}${colors.reset} ${color}[${level}]${colors.reset}`, ...args);
-  
+
   // 存储日志
   storeLog(level, message);
 }
@@ -152,6 +152,7 @@ export const log = {
   info: (...args) => logMessage('info', ...args),
   warn: (...args) => logMessage('warn', ...args),
   error: (...args) => logMessage('error', ...args),
+  debug: (...args) => logMessage('debug', ...args),
   request: logRequest,
   // API 方法
   getLogs,

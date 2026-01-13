@@ -26,3 +26,18 @@ public/images
 
 # 编译输出
 dist/
+
+# 开发/测试目录
+antiproxy_dev/
+original-project/
+quota-monitor/
+
+# 临时文件
+.current_version
+切换说明
+
+# 文档（可选提交）
+docs/
+*.md
+!README.md
+!CHANGELOG.md

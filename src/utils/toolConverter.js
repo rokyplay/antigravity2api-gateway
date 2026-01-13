@@ -25,7 +25,7 @@ function convertSingleTool(name, description, parameters, sessionId, actualModel
   if (cleanedParams.type === undefined) cleanedParams.type = 'OBJECT';
   else if (cleanedParams.type === 'object') cleanedParams.type = 'OBJECT';
   if ((cleanedParams.type === 'OBJECT' || cleanedParams.type === 'object') && cleanedParams.properties === undefined) cleanedParams.properties = {};
-  //console.log(JSON.stringify(tool,null,2),100)
+  
   return {
     name: safeName,
     description: description || '',
@@ -43,7 +43,7 @@ function convertSingleTool(name, description, parameters, sessionId, actualModel
  */
 export function convertOpenAIToolsToAntigravity(openaiTools, sessionId, actualModelName) {
   if (!openaiTools || openaiTools.length === 0) return [];
-  
+
   const declarations = openaiTools.map((tool) => {
     const func = tool.function || {};
     return convertSingleTool(
@@ -54,7 +54,7 @@ export function convertOpenAIToolsToAntigravity(openaiTools, sessionId, actualMo
       actualModelName
     );
   });
-  
+
   return [{
     functionDeclarations: declarations
   }];
@@ -70,7 +70,7 @@ export function convertOpenAIToolsToAntigravity(openaiTools, sessionId, actualMo
  */
 export function convertClaudeToolsToAntigravity(claudeTools, sessionId, actualModelName) {
   if (!claudeTools || claudeTools.length === 0) return [];
-  
+
   const declarations = claudeTools.map((tool) => {
     return convertSingleTool(
       tool.name,
@@ -80,7 +80,7 @@ export function convertClaudeToolsToAntigravity(claudeTools, sessionId, actualMo
       actualModelName
     );
   });
-  
+
   return [{
     functionDeclarations: declarations
   }];
@@ -98,7 +98,7 @@ export function convertClaudeToolsToAntigravity(claudeTools, sessionId, actualMo
  */
 export function convertGeminiToolsToAntigravity(geminiTools, sessionId, actualModelName) {
   if (!geminiTools || geminiTools.length === 0) return [];
-  
+
   const allDeclarations = [];
   for (const tool of geminiTools) {
     // 格式1: 已经是 functionDeclarations 格式（支持驼峰和下划线命名）
@@ -125,7 +125,7 @@ export function convertGeminiToolsToAntigravity(geminiTools, sessionId, actualMo
     }
     // 格式3：不处理
   }
-  
+
   return allDeclarations.length > 0 ? [{
     functionDeclarations: allDeclarations
   }] : [];

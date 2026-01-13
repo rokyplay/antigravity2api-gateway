@@ -4,6 +4,8 @@ import { generateRequestId } from '../idGenerator.js';
 import { getSignature, shouldCacheSignature, isImageModel } from '../thoughtSignatureCache.js';
 import { setToolNameMapping } from '../toolNameCache.js';
 import { getThoughtSignatureForModel, getToolSignatureForModel, sanitizeToolName, modelMapping, isEnableThinking, generateGenerationConfig } from '../utils.js';
+import { remapFunctionCallArgs } from '../messageCleaner.js';
+import fs from 'fs';
 
 /**
  * 获取签名上下文
@@ -129,11 +131,26 @@ export function createThoughtPart(text, signature = null) {
  * @returns {Object} 函数调用 part
  */
 export function createFunctionCallPart(id, name, args, signature = null) {
+  // 解析参数
+  let parsedArgs;
+  if (typeof args === 'string') {
+    try {
+      parsedArgs = JSON.parse(args);
+    } catch {
+      parsedArgs = { query: args };
+    }
+  } else {
+    parsedArgs = args || {};
+  }
+
+  // 应用参数重映射
+  const remappedArgs = remapFunctionCallArgs(name, parsedArgs);
+
   const part = {
     functionCall: {
       id,
       name,
-      args: typeof args === 'string' ? { query: args } : args
+      args: remappedArgs
     }
   };
   if (signature) {
@@ -192,7 +209,7 @@ export function pushModelMessage({ parts, toolCalls, hasContent }, antigravityMe
  */
 export function buildRequestBody({ contents, tools, generationConfig, sessionId, systemInstruction }, token, actualModelName) {
   const hasTools = tools && tools.length > 0;
-  
+
   const requestBody = {
     project: token.projectId,
     requestId: generateRequestId(),
@@ -206,16 +223,41 @@ export function buildRequestBody({ contents, tools, generationConfig, sessionId,
     requestType: 'agent'
   };
 
-  // 只在有工具时才添加 tools 和 toolConfig 字段
+  // 添加工具和 google_search
   if (hasTools) {
-    requestBody.request.tools = tools;
+    // 始终添加 google_search 工具，让模型可以使用搜索功能
+    requestBody.request.tools = [
+      ...tools,
+      { google_search: {} }
+    ];
     requestBody.request.toolConfig = { functionCallingConfig: { mode: 'VALIDATED' } };
+  } else {
+    // 即使没有其他工具，也添加 google_search
+    requestBody.request.tools = [{ google_search: {} }];
   }
 
   // 构建系统提示词
   const systemInstructionObj = buildSystemInstruction(systemInstruction);
   if (systemInstructionObj) {
     requestBody.request.systemInstruction = systemInstructionObj;
+  }
+
+  // 【调试】打印完整请求体到文件
+  const debugPath = '/app/data/debug-request.json';
+  try {
+    const debugData = {
+      timestamp: new Date().toISOString(),
+      model: actualModelName,
+      hasTools,
+      toolsCount: tools?.length || 0,
+      systemInstruction: requestBody.request.systemInstruction,
+      contentsLength: contents?.length || 0,
+      fullRequest: requestBody
+    };
+    fs.writeFileSync(debugPath, JSON.stringify(debugData, null, 2));
+    console.log('=== 请求已写入 ' + debugPath + ' ===');
+  } catch (e) {
+    console.error('写入调试文件失败:', e.message);
   }
 
   return requestBody;
@@ -250,10 +292,25 @@ export function buildSystemPromptParts(userSystemPrompt) {
     if (typeof userSystemPrompt === 'string' && userSystemPrompt.trim()) {
       userParts = [{ text: userSystemPrompt.trim() }];
     } else if (Array.isArray(userSystemPrompt)) {
-      userParts = userSystemPrompt.filter(p => p && (p.text || p.inlineData));
+      // 过滤并清理 parts，移除 cache_control 等不支持的字段
+      userParts = userSystemPrompt
+        .filter(p => p && (p.text || p.inlineData))
+        .map(p => {
+          const cleaned = {};
+          if (p.text) cleaned.text = p.text;
+          if (p.inlineData) cleaned.inlineData = p.inlineData;
+          return cleaned;
+        });
     } else if (typeof userSystemPrompt === 'object' && userSystemPrompt.parts) {
       // 处理 { role: 'user', parts: [...] } 格式
-      userParts = userSystemPrompt.parts.filter(p => p && (p.text || p.inlineData));
+      userParts = userSystemPrompt.parts
+        .filter(p => p && (p.text || p.inlineData))
+        .map(p => {
+          const cleaned = {};
+          if (p.text) cleaned.text = p.text;
+          if (p.inlineData) cleaned.inlineData = p.inlineData;
+          return cleaned;
+        });
     }
   }
   

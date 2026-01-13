@@ -169,7 +169,7 @@ export const handleGeminiModelDetail = async (req, res) => {
 export const handleGeminiRequest = async (req, res, modelName, isStream) => {
   const maxRetries = Number(config.retryTimes || 0);
   const safeRetries = maxRetries > 0 ? Math.floor(maxRetries) : 0;
-  
+
   try {
     const token = await tokenManager.getToken();
     if (!token) {
@@ -177,11 +177,23 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
     }
 
     const isImageModel = modelName.includes('-image');
-    const requestBody = generateGeminiRequestBody(req.body, modelName, token);
-    
-    if (isImageModel) {
-      prepareImageRequest(requestBody);
-    }
+
+    // 【改进】创建请求体生成函数，支持重试时使用新 token
+    const createRequestBody = (t) => {
+      const body = generateGeminiRequestBody(req.body, modelName, t);
+      if (isImageModel) {
+        prepareImageRequest(body);
+      }
+      return body;
+    };
+
+    const requestBody = createRequestBody(token);
+
+    // 【改进】重试选项：支持重新获取 token
+    const retryOptions = {
+      currentToken: token,
+      getToken: () => tokenManager.getToken()
+    };
 
     if (isStream) {
       setStreamHeaders(res);
@@ -191,9 +203,13 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
         if (isImageModel) {
           // 生图模型：使用非流式获取结果后一次性返回
           const { content, usage, reasoningSignature } = await with429Retry(
-            () => generateAssistantResponseNoStream(requestBody, token),
+            (attempt, currentToken) => {
+              const body = attempt > 0 ? createRequestBody(currentToken) : requestBody;
+              return generateAssistantResponseNoStream(body, currentToken || token);
+            },
             safeRetries,
-            'gemini.stream.image '
+            'gemini.stream.image ',
+            retryOptions
           );
           const chunk = createGeminiResponse(content, null, reasoningSignature, null, 'STOP', usage);
           writeStreamData(res, chunk);
@@ -201,31 +217,35 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
           endStream(res, false);
           return;
         }
-        
+
         let usageData = null;
         let hasToolCall = false;
 
         await with429Retry(
-          () => generateAssistantResponse(requestBody, token, (data) => {
-            if (data.type === 'usage') {
-              usageData = data.usage;
-            } else if (data.type === 'reasoning') {
-              // Gemini 思考内容
-              const chunk = createGeminiResponse(null, data.reasoning_content, data.thoughtSignature, null, null, null);
-              writeStreamData(res, chunk);
-            } else if (data.type === 'tool_calls') {
-              hasToolCall = true;
-              // Gemini 工具调用
-              const chunk = createGeminiResponse(null, null, null, data.tool_calls, null, null);
-              writeStreamData(res, chunk);
-            } else {
-              // 普通文本
-              const chunk = createGeminiResponse(data.content, null, null, null, null, null);
-              writeStreamData(res, chunk);
-            }
-          }),
+          (attempt, currentToken) => {
+            const body = attempt > 0 ? createRequestBody(currentToken) : requestBody;
+            return generateAssistantResponse(body, currentToken || token, (data) => {
+              if (data.type === 'usage') {
+                usageData = data.usage;
+              } else if (data.type === 'reasoning') {
+                // Gemini 思考内容
+                const chunk = createGeminiResponse(null, data.reasoning_content, data.thoughtSignature, null, null, null);
+                writeStreamData(res, chunk);
+              } else if (data.type === 'tool_calls') {
+                hasToolCall = true;
+                // Gemini 工具调用
+                const chunk = createGeminiResponse(null, null, null, data.tool_calls, null, null);
+                writeStreamData(res, chunk);
+              } else {
+                // 普通文本
+                const chunk = createGeminiResponse(data.content, null, null, null, null, null);
+                writeStreamData(res, chunk);
+              }
+            });
+          },
           safeRetries,
-          'gemini.stream '
+          'gemini.stream ',
+          retryOptions
         );
 
         // 发送结束块和 usage
@@ -245,55 +265,19 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
         logger.error('Gemini 流式请求失败:', error.message);
         return;
       }
-    } else if (config.fakeNonStream && !isImageModel) {
-      // 假非流模式：使用流式API获取数据，组装成非流式响应
-      req.setTimeout(0);
-      res.setTimeout(0);
-      
-      let content = '';
-      let reasoningContent = '';
-      let reasoningSignature = null;
-      const toolCalls = [];
-      let usageData = null;
-      
-      try {
-        await with429Retry(
-          () => generateAssistantResponse(requestBody, token, (data) => {
-            if (data.type === 'usage') {
-              usageData = data.usage;
-            } else if (data.type === 'reasoning') {
-              reasoningContent += data.reasoning_content || '';
-              if (data.thoughtSignature) {
-                reasoningSignature = data.thoughtSignature;
-              }
-            } else if (data.type === 'tool_calls') {
-              toolCalls.push(...data.tool_calls);
-            } else if (data.type === 'text') {
-              content += data.content || '';
-            }
-          }),
-          safeRetries,
-          'gemini.fake_no_stream '
-        );
-        
-        const finishReason = "STOP";
-        const response = createGeminiResponse(content, reasoningContent || null, reasoningSignature, toolCalls, finishReason, usageData);
-        res.json(response);
-      } catch (error) {
-        logger.error('Gemini 假非流请求失败:', error.message);
-        if (res.headersSent) return;
-        const statusCode = error.statusCode || error.status || 500;
-        res.status(statusCode).json(buildGeminiErrorPayload(error, statusCode));
-      }
     } else {
       // 非流式
       req.setTimeout(0);
       res.setTimeout(0);
 
       const { content, reasoningContent, reasoningSignature, toolCalls, usage } = await with429Retry(
-        () => generateAssistantResponseNoStream(requestBody, token),
+        (attempt, currentToken) => {
+          const body = attempt > 0 ? createRequestBody(currentToken) : requestBody;
+          return generateAssistantResponseNoStream(body, currentToken || token);
+        },
         safeRetries,
-        'gemini.no_stream '
+        'gemini.no_stream ',
+        retryOptions
       );
 
       const finishReason = toolCalls.length > 0 ? "STOP" : "STOP";

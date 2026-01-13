@@ -37,11 +37,42 @@ export function sanitizeToolName(name) {
 }
 
 // ==================== 参数清理 ====================
+
+// 清理消息中的 cache_control 字段（Claude prompt caching 功能，反重力不支持）
+// 参考：clewdr 项目的 clean_cache_control_from_messages 实现
+export function cleanCacheControlFromMessages(messages) {
+  if (!Array.isArray(messages)) return messages;
+
+  for (const msg of messages) {
+    // 清理消息级别的 cache_control
+    if (msg.cache_control) delete msg.cache_control;
+
+    // 清理 content 中的 cache_control
+    if (typeof msg.content === 'string') continue;
+
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block && typeof block === 'object' && block.cache_control) {
+          delete block.cache_control;
+        }
+      }
+    }
+  }
+
+  return messages;
+}
+
+// Gemini API 不支持的 JSON Schema 高级特性需要过滤掉
 const EXCLUDED_KEYS = new Set([
   '$schema', 'additionalProperties', 'minLength', 'maxLength',
   'minItems', 'maxItems', 'uniqueItems', 'exclusiveMaximum',
   'exclusiveMinimum', 'const', 'anyOf', 'oneOf', 'allOf',
-  'any_of', 'one_of', 'all_of', 'multipleOf'
+  'any_of', 'one_of', 'all_of', 'multipleOf',
+  // Claude Code 工具定义中常见的不支持属性
+  'propertyNames', 'patternProperties', 'unevaluatedProperties',
+  'dependentRequired', 'dependentSchemas', 'if', 'then', 'else',
+  'contentMediaType', 'contentEncoding', 'examples', 'default',
+  '$id', '$ref', '$defs', 'definitions', '$comment'
 ]);
 
 // 需要转换为大写的 type 值映射

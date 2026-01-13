@@ -17,7 +17,7 @@ function generateFunctionCallId() {
  */
 function processFunctionCallIds(contents) {
   const functionCallIds = [];
-
+  
   // 收集所有 functionCall 的 ID
   contents.forEach(content => {
     if (content.role === 'model' && content.parts && Array.isArray(content.parts)) {
@@ -75,12 +75,12 @@ function processModelThoughts(content, reasoningSignature, reasoningContent, too
     !part.functionResponse &&
     !part.text &&
     !part.inlineData;
-
+  
   // 查找 thought 和独立 thoughtSignature 的位置
   let thoughtIndex = -1;
   let signatureIndex = -1;
   let signatureValue = null;
-
+  
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
     if (part.thought === true && !part.thoughtSignature) {
@@ -91,7 +91,7 @@ function processModelThoughts(content, reasoningSignature, reasoningContent, too
       signatureValue = part.thoughtSignature;
     }
   }
-
+  
   // 合并或添加 thought 和签名
   if (thoughtIndex !== -1 && signatureIndex !== -1) {
     parts[thoughtIndex].thoughtSignature = signatureValue;
@@ -103,7 +103,7 @@ function processModelThoughts(content, reasoningSignature, reasoningContent, too
     // 使用与签名绑定的缓存内容
     parts.unshift(createThoughtPart(fallbackContent, fallbackSig));
   }
-
+  
   // 收集独立的签名 parts（用于 functionCall）
   const standaloneSignatures = [];
   for (let i = parts.length - 1; i >= 0; i--) {
@@ -112,7 +112,7 @@ function processModelThoughts(content, reasoningSignature, reasoningContent, too
       standaloneSignatures.unshift({ index: i, signature: part.thoughtSignature });
     }
   }
-
+  
   // 为 functionCall / inlineData 分配签名
   let sigIndex = 0;
   for (let i = 0; i < parts.length; i++) {
@@ -129,7 +129,7 @@ function processModelThoughts(content, reasoningSignature, reasoningContent, too
       if (partFallback) part.thoughtSignature = partFallback;
     }
   }
-
+  
   // 移除已使用的独立签名 parts
   for (let i = standaloneSignatures.length - 1; i >= 0; i--) {
     if (i < sigIndex) {
@@ -150,7 +150,7 @@ export function generateGeminiRequestBody(geminiBody, modelName, token) {
     if (request.tools && Array.isArray(request.tools)) {
       request.tools = convertGeminiToolsToAntigravity(request.tools, token.sessionId, actualModelName);
     }
-
+    
     const hasTools = request.tools && request.tools.length > 0;
     const { reasoningSignature, reasoningContent, toolSignature, toolContent } = getSignatureContext(token.sessionId, actualModelName, hasTools);
 
@@ -163,12 +163,12 @@ export function generateGeminiRequestBody(geminiBody, modelName, token) {
 
   // 使用统一参数规范化模块处理 Gemini 格式参数
   const normalizedParams = normalizeGeminiParameters(request.generationConfig || {});
-
+  
   // 转换为 generationConfig 格式
   request.generationConfig = toGenerationConfig(normalizedParams, enableThinking, actualModelName);
   request.sessionId = token.sessionId;
   delete request.safetySettings;
-
+  
   // 添加工具配置
   if (request.tools && request.tools.length > 0 && !request.toolConfig) {
     request.toolConfig = { functionCallingConfig: { mode: 'VALIDATED' } };
@@ -182,7 +182,7 @@ export function generateGeminiRequestBody(geminiBody, modelName, token) {
   } else {
     delete request.systemInstruction;
   }
-
+  
   //console.log(JSON.stringify(request, null, 2))
 
   const requestBody = {
@@ -190,8 +190,7 @@ export function generateGeminiRequestBody(geminiBody, modelName, token) {
     requestId: generateRequestId(),
     request: request,
     model: actualModelName,
-    userAgent: 'antigravity',
-    requestType: 'agent'
+    userAgent: 'antigravity'
   };
 
   return requestBody;

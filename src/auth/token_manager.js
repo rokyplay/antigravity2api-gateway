@@ -10,6 +10,7 @@ import {
 } from '../constants/index.js';
 import TokenStore from './token_store.js';
 import { TokenError } from '../utils/errors.js';
+import rateLimitTracker, { RateLimitReason } from './rate_limit_tracker.js';
 
 // 轮询策略枚举
 const RotationStrategy = {
@@ -229,12 +230,11 @@ class TokenManager {
   }
 
   async fetchProjectId(token) {
-    const apiHost = config.api.host;
     const response = await axios(buildAxiosRequestConfig({
       method: 'POST',
-      url: `https://${apiHost}/v1internal:loadCodeAssist`,
+      url: 'https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
       headers: {
-        'Host': apiHost,
+        'Host': config.api.host,
         'User-Agent': config.api.userAgent,
         'Authorization': `Bearer ${token.access_token}`,
         'Content-Type': 'application/json',
@@ -508,6 +508,7 @@ class TokenManager {
 
   /**
    * 默认策略（round_robin / request_count）的 token 获取
+   * 【改进】集成限流追踪器，自动跳过限流账号
    * @private
    */
   async _getTokenForDefaultStrategy() {
@@ -518,6 +519,7 @@ class TokenManager {
       const index = (startIndex + i) % totalTokens;
       const token = this.tokens[index];
 
+      // 限流检查已禁用 - 直接使用 token
       try {
         const result = await this._prepareToken(token);
         if (result === 'disable') {
@@ -545,6 +547,7 @@ class TokenManager {
       }
     }
 
+    // 所有 token 都无法使用
     return null;
   }
 
@@ -767,10 +770,53 @@ class TokenManager {
       tokenCounts: Object.fromEntries(this.tokenRequestCounts)
     };
   }
+
+  // ===== 限流管理方法 =====
+
+  /**
+   * 标记账号限流（从外部调用，通常在 handler 中）
+   * @param {Object} token - Token 对象
+   * @param {number} status - HTTP 状态码
+   * @param {string} [retryAfter] - Retry-After 头
+   * @param {string} errorBody - 错误响应体
+   * @param {string} [model] - 模型名称
+   */
+  markRateLimited(token, status, retryAfter, errorBody, model = null) {
+    const accountId = token.email || token.refresh_token?.slice(-8) || 'unknown';
+    rateLimitTracker.parseFromError(accountId, status, retryAfter, errorBody, model);
+  }
+
+  /**
+   * 标记账号请求成功
+   * @param {Object} token - Token 对象
+   */
+  markSuccess(token) {
+    const accountId = token.email || token.refresh_token?.slice(-8) || 'unknown';
+    rateLimitTracker.markSuccess(accountId);
+  }
+
+  /**
+   * 检查账号是否在限流中
+   * @param {Object} token - Token 对象
+   * @param {string} [model] - 模型名称
+   * @returns {boolean}
+   */
+  isRateLimited(token, model = null) {
+    const accountId = token.email || token.refresh_token?.slice(-8) || 'unknown';
+    return rateLimitTracker.isRateLimited(accountId, model);
+  }
+
+  /**
+   * 获取限流状态
+   * @returns {Object}
+   */
+  getRateLimitStatus() {
+    return rateLimitTracker.getStatus();
+  }
 }
 
-// 导出策略枚举
-export { RotationStrategy };
+// 导出策略枚举和限流追踪器
+export { RotationStrategy, rateLimitTracker };
 
 const tokenManager = new TokenManager();
 export default tokenManager;

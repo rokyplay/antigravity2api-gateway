@@ -19,22 +19,12 @@ import {
 } from './stream_parser.js';
 import { setSignature, shouldCacheSignature, isImageModel } from '../utils/thoughtSignatureCache.js';
 
-// 请求客户端：优先使用 AntigravityRequester，失败则自动降级到 axios
+// 需要标记限流的状态码
+const RATE_LIMIT_STATUS_CODES = [429, 503, 529];
+
+// 请求客户端：优先使用 AntigravityRequester，失败则降级到 axios
 let requester = null;
 let useAxios = false;
-
-// 初始化请求客户端
-if (config.useNativeAxios === true) {
-  useAxios = true;
-  logger.info('使用原生 axios 请求');
-} else {
-  try {
-    requester = new AntigravityRequester();
-  } catch (error) {
-    logger.warn('AntigravityRequester 初始化失败，自动降级使用 axios:', error.message);
-    useAxios = true;
-  }
-}
 
 // ==================== 调试：最终请求/原始响应完整输出（单文件追加模式） ====================
 const DEBUG_DUMP_FILE = path.join(process.cwd(), 'data', 'debug-dump.log');
@@ -190,6 +180,16 @@ function getDefaultModelList() {
   };
 }
 
+if (config.useNativeAxios === true) {
+  useAxios = true;
+} else {
+  try {
+    requester = new AntigravityRequester();
+  } catch (error) {
+    console.warn('AntigravityRequester 初始化失败，降级使用 axios:', error.message);
+    useAxios = true;
+  }
+}
 
 // 注册对象池与模型缓存的内存清理回调
 function registerMemoryCleanup() {
@@ -234,11 +234,16 @@ function buildRequesterConfig(headers, body = null) {
 }
 
 
-// 统一错误处理
-async function handleApiError(error, token, dumpId = null) {
+// 统一错误处理（集成限流标记）
+async function handleApiError(error, token, dumpId = null, model = null) {
   const status = error.response?.status || error.status || error.statusCode || 500;
   let errorBody = error.message;
-  
+
+  // 获取 Retry-After 头
+  const retryAfter = error.response?.headers?.['retry-after'] ||
+                     error.response?.headers?.get?.('retry-after') ||
+                     null;
+
   if (error.response?.data?.readable) {
     const chunks = [];
     for await (const chunk of error.response.data) {
@@ -254,7 +259,12 @@ async function handleApiError(error, token, dumpId = null) {
   if (dumpId) {
     await dumpFinalRawResponse(dumpId, String(errorBody ?? ''), 'error.txt');
   }
-  
+
+  // 【新增】检测限流状态码并标记
+  const errorBodyStr = typeof errorBody === 'string' ? errorBody : JSON.stringify(errorBody);
+  // 限流标记已禁用 - 由 with429Retry 处理重试
+  // if (isQuotaExhausted) { ... }
+
   if (status === 403) {
     if (JSON.stringify(errorBody).includes("The caller does not")){
       throw createApiError(`超出模型最大上下文。错误详情: ${errorBody}`, status, errorBody);
@@ -262,7 +272,7 @@ async function handleApiError(error, token, dumpId = null) {
     tokenManager.disableCurrentToken(token);
     throw createApiError(`该账号没有使用权限，已自动禁用。错误详情: ${errorBody}`, status, errorBody);
   }
-  
+
   throw createApiError(`API请求失败 (${status}): ${errorBody}`, status, errorBody);
 }
 
@@ -350,9 +360,12 @@ export async function generateAssistantResponse(requestBody, token, callback) {
     if (dumpId) {
       await dumpStreamResponse(dumpId, streamCollector);
     }
+
+    // 【新增】标记成功
+    tokenManager.markSuccess(token);
   } catch (error) {
     releaseLineBuffer(lineBuffer); // 确保归还
-    await handleApiError(error, token, dumpId);
+    await handleApiError(error, token, dumpId, requestBody.model);
   }
 }
 
@@ -462,131 +475,79 @@ export async function getModelsWithQuotas(token) {
 }
 
 export async function generateAssistantResponseNoStream(requestBody, token) {
-  
-  const headers = buildHeaders(token);
-  const dumpId = isDebugDumpEnabled() ? createDumpId('no_stream') : null;
-  if (dumpId) await dumpFinalRequest(dumpId, requestBody);
-  let data;
-  
-  try {
-    if (useAxios) {
-      if (dumpId) {
-        const resp = await httpRequest({
-          method: 'POST',
-          url: config.api.noStreamUrl,
-          headers,
-          data: requestBody,
-          responseType: 'text'
-        });
-        const rawText = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data, null, 2);
-        await dumpFinalRawResponse(dumpId, rawText, 'json');
-        data = JSON.parse(rawText);
-      } else {
-        data = (await httpRequest({
-          method: 'POST',
-          url: config.api.noStreamUrl,
-          headers,
-          data: requestBody
-        })).data;
-      }
-    } else {
-      const response = await requester.antigravity_fetch(config.api.noStreamUrl, buildRequesterConfig(headers, requestBody));
-      if (response.status !== 200) {
-        const errorBody = await response.text();
-        if (dumpId) await dumpFinalRawResponse(dumpId, errorBody, 'txt');
-        throw { status: response.status, message: errorBody };
-      }
-      const rawText = await response.text();
-      if (dumpId) await dumpFinalRawResponse(dumpId, rawText, 'json');
-      data = JSON.parse(rawText);
-    }
-  } catch (error) {
-    await handleApiError(error, token, dumpId);
-  }
-  //console.log(JSON.stringify(data));
-  // 解析响应内容
-  const parts = data.response?.candidates?.[0]?.content?.parts || [];
-  let content = '';
-  let reasoningContent = '';
-  let reasoningSignature = null;
-  let lastSeenSignature = null;
-  const toolCalls = [];
-  const imageUrls = [];
-  
-  for (const part of parts) {
-    if (part.thoughtSignature) {
-      lastSeenSignature = part.thoughtSignature;
-    }
-    if (part.thought === true) {
-      // 思维链内容 - 使用 DeepSeek 格式的 reasoning_content
-      reasoningContent += part.text || '';
-      if (part.thoughtSignature) {
-        // 以“最新出现”的签名为准（有些响应会在末尾才给签名）
-        reasoningSignature = part.thoughtSignature;
-      }
-    } else if (part.text !== undefined) {
-      content += part.text;
-    } else if (part.functionCall) {
-      const toolCall = convertToToolCall(part.functionCall, requestBody.request?.sessionId, requestBody.model);
-      const sig = part.thoughtSignature || lastSeenSignature || null;
-      if (sig) toolCall.thoughtSignature = sig;
-      toolCalls.push(toolCall);
-    } else if (part.inlineData) {
-      // 保存图片到本地并获取 URL
-      const imageUrl = saveBase64Image(part.inlineData.data, part.inlineData.mimeType);
-      imageUrls.push(imageUrl);
-    }
-  }
 
-  // 若本轮未在 thought part 上拿到签名，则回退使用“最后出现”的签名（Gemini 等可能只在 functionCall part 上给签名）
-  if (!reasoningSignature && lastSeenSignature) {
-    reasoningSignature = lastSeenSignature;
-  }
-  
-  // 提取 token 使用统计
-  const usage = data.response?.usageMetadata;
-  const usageData = usage ? {
-    prompt_tokens: usage.promptTokenCount || 0,
-    completion_tokens: usage.candidatesTokenCount || 0,
-    total_tokens: usage.totalTokenCount || 0
-  } : null;
-  
-  // 将新的签名和思考内容写入全局缓存（按 model），供后续请求兜底使用
-  const sessionId = requestBody.request?.sessionId;
-  const model = requestBody.model;
-  const hasTools = toolCalls.length > 0;
-  const isImage = isImageModel(model);
-  
-  // 判断是否应该缓存签名
-  if (sessionId && model && shouldCacheSignature({ hasTools, isImageModel: isImage })) {
-    // 获取最终使用的签名（优先使用工具签名，回退到思维签名）
-    let finalSignature = reasoningSignature;
-    
-    // 工具签名：取最后一个带 thoughtSignature 的工具作为缓存源（更接近"最新"）
-    if (hasTools) {
-      for (let i = toolCalls.length - 1; i >= 0; i--) {
-        const sig = toolCalls[i]?.thoughtSignature;
-        if (sig) {
-          finalSignature = sig;
-          break;
+  // 【核心改进】始终使用流式请求，然后收集完整响应返回
+  // 这样可以避免反重力可能的非流式支持问题
+  const dumpId = isDebugDumpEnabled() ? createDumpId('fake_no_stream') : null;
+  if (dumpId) await dumpFinalRequest(dumpId, requestBody);
+
+  // 收集流式响应的所有数据
+  const collectedData = {
+    content: '',
+    reasoningContent: '',
+    reasoningSignature: null,
+    toolCalls: [],
+    usage: null
+  };
+
+  try {
+    await generateAssistantResponse(requestBody, token, (data) => {
+      if (data.type === 'usage') {
+        collectedData.usage = data.usage;
+      } else if (data.type === 'reasoning') {
+        collectedData.reasoningContent += data.reasoning_content || '';
+        if (data.thoughtSignature) {
+          collectedData.reasoningSignature = data.thoughtSignature;
+        }
+      } else if (data.type === 'tool_calls') {
+        // 收集工具调用
+        collectedData.toolCalls.push(...data.tool_calls);
+      } else if (data.content) {
+        collectedData.content += data.content;
+      }
+    });
+
+    if (dumpId) {
+      await dumpFinalRawResponse(dumpId, JSON.stringify(collectedData, null, 2), 'json');
+    }
+
+    // 将流式签名写入缓存
+    const sessionId = requestBody.request?.sessionId;
+    const model = requestBody.model;
+    const hasTools = collectedData.toolCalls.length > 0;
+    const isImage = isImageModel(model);
+
+    if (sessionId && model && shouldCacheSignature({ hasTools, isImageModel: isImage })) {
+      let finalSignature = collectedData.reasoningSignature;
+
+      if (hasTools) {
+        for (let i = collectedData.toolCalls.length - 1; i >= 0; i--) {
+          const sig = collectedData.toolCalls[i]?.thoughtSignature;
+          if (sig) {
+            finalSignature = sig;
+            break;
+          }
         }
       }
-    }
-    
-    if (finalSignature) {
-      const cachedContent = reasoningContent || ' ';
-      setSignature(sessionId, model, finalSignature, cachedContent, { hasTools, isImageModel: isImage });
-    }
-  }
 
-  // 生图模型：转换为 markdown 格式
-  if (imageUrls.length > 0) {
-    let markdown = content ? content + '\n\n' : '';
-    markdown += imageUrls.map(url => `![image](${url})`).join('\n\n');
-    return { content: markdown, reasoningContent: reasoningContent || null, reasoningSignature, toolCalls, usage: usageData };
+      if (finalSignature) {
+        const cachedContent = collectedData.reasoningContent || ' ';
+        setSignature(sessionId, model, finalSignature, cachedContent, { hasTools, isImageModel: isImage });
+      }
+    }
+
+    return {
+      content: collectedData.content,
+      reasoningContent: collectedData.reasoningContent || null,
+      reasoningSignature: collectedData.reasoningSignature,
+      toolCalls: collectedData.toolCalls,
+      usage: collectedData.usage
+    };
+
+  } catch (error) {
+    // 流式请求失败，错误已在 generateAssistantResponse 中处理
+    throw error;
   }
-  
-  return { content, reasoningContent: reasoningContent || null, reasoningSignature, toolCalls, usage: usageData };
 }
 
 export async function generateImageForSD(requestBody, token) {
