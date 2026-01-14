@@ -261,9 +261,14 @@ async function handleApiError(error, token, dumpId = null, model = null) {
   }
 
   // 【新增】检测限流状态码并标记
-  const errorBodyStr = typeof errorBody === 'string' ? errorBody : JSON.stringify(errorBody);
-  // 限流标记已禁用 - 由 with429Retry 处理重试
-  // if (isQuotaExhausted) { ... }
+  // 如果遇到额度耗尽，标记 Token 状态
+  const errorBodyStr = typeof errorBody === 'string' ? errorBody : JSON.stringify(errorBody || '');
+  if (status === 429) {
+    if (errorBodyStr.includes('QUOTA_EXHAUSTED') || errorBodyStr.includes('RESOURCE_EXHAUSTED')) {
+      logger.warn(`账号额度已耗尽，标记为不可用: ${token.email || 'unknown'}`);
+      tokenManager.markQuotaExhausted(token);
+    }
+  }
 
   if (status === 403) {
     if (JSON.stringify(errorBody).includes("The caller does not")){

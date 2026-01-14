@@ -32,46 +32,49 @@ function cleanupEventListeners(element) {
     eventListenerRegistry.delete(element);
 }
 
-// 导出 Token（需要密码验证）
+// 导出 Token（需要管理员密钥验证）
 async function exportTokens() {
-    const password = await showPasswordPrompt('请输入管理员密码以导出 Token');
-    if (!password) return;
-    
-    showLoading('正在导出...');
-    try {
-        const response = await authFetch('/admin/tokens/export', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password })
-        });
-        
-        const data = await response.json();
-        hideLoading();
-        
-        if (data.success) {
-            // 创建下载
-            const blob = new Blob([JSON.stringify(data.data, null, 2)], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `tokens-export-${new Date().toISOString().slice(0, 10)}.json`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            showToast('导出成功', 'success');
-        } else {
-            // 密码错误或其他错误时显示具体错误信息
-            if (response.status === 403) {
-                showToast('密码错误，请重新输入', 'error');
+    const result = await withAdminSecret(async (secretKey) => {
+        showLoading('正在导出...');
+        try {
+            const response = await authFetch('/admin/tokens/export', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Secret': secretKey
+                }
+            });
+
+            const data = await response.json();
+            hideLoading();
+
+            if (data.success) {
+                // 创建下载
+                const blob = new Blob([JSON.stringify(data.data, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `tokens-export-${new Date().toISOString().slice(0, 10)}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                showToast('导出成功', 'success');
+                return { success: true };
             } else {
+                if (data.requireAdminSecret) {
+                    throw { message: '管理员密钥验证失败', status: 403 };
+                }
                 showToast(data.message || '导出失败', 'error');
+                return { success: false };
             }
+        } catch (error) {
+            hideLoading();
+            throw error;
         }
-    } catch (error) {
-        hideLoading();
-        showToast('导出失败: ' + error.message, 'error');
-    }
+    }, '导出Token');
+
+    if (result?.cancelled) return;
 }
 
 // 导入 Token（需要密码验证）- 打开拖拽上传弹窗
@@ -156,13 +159,7 @@ function showImportUploadModal() {
                     <option value="replace">替换（清空现有，导入新的）</option>
                 </select>
             </div>
-            
-            <!-- 密码验证（仅文件上传和JSON导入时显示） -->
-            <div class="form-group" id="importPasswordGroup">
-                <label>🔐 管理员密码</label>
-                <input type="password" id="importPassword" placeholder="请输入管理员密码验证">
-            </div>
-            
+
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="closeImportModal()">取消</button>
                 <button class="btn btn-success" id="confirmImportBtn" onclick="confirmImportFromModal()" disabled>✅ 确认</button>
@@ -256,26 +253,23 @@ function switchImportTab(tab) {
     document.getElementById('importTabJson').classList.toggle('hidden', tab !== 'json');
     document.getElementById('importTabManual').classList.toggle('hidden', tab !== 'manual');
     
-    // 切换导入模式和密码输入的显示
+    // 切换导入模式显示
     const importModeGroup = document.getElementById('importModeGroup');
-    const importPasswordGroup = document.getElementById('importPasswordGroup');
     const confirmBtn = document.getElementById('confirmImportBtn');
-    
+
     if (tab === 'manual') {
-        // 手动填入模式：隐藏导入模式和密码
+        // 手动填入模式：隐藏导入模式
         importModeGroup.classList.add('hidden');
-        importPasswordGroup.classList.add('hidden');
         // 更新按钮状态
         const accessToken = document.getElementById('manualAccessToken').value.trim();
         const refreshToken = document.getElementById('manualRefreshToken').value.trim();
         confirmBtn.disabled = !accessToken || !refreshToken;
         confirmBtn.textContent = '✅ 添加';
     } else {
-        // 文件上传或JSON导入模式：显示导入模式和密码
+        // 文件上传或JSON导入模式：显示导入模式
         importModeGroup.classList.remove('hidden');
-        importPasswordGroup.classList.remove('hidden');
         confirmBtn.textContent = '✅ 确认导入';
-        
+
         // 清除之前的数据
         if (tab === 'file') {
             // 切换到文件上传时，清除JSON输入和手动输入
@@ -533,12 +527,12 @@ async function confirmImportFromModal() {
         const accessToken = document.getElementById('manualAccessToken').value.trim();
         const refreshToken = document.getElementById('manualRefreshToken').value.trim();
         const expiresIn = parseInt(document.getElementById('manualExpiresIn').value) || 3599;
-        
+
         if (!accessToken || !refreshToken) {
             showToast('请填写完整的Token信息', 'warning');
             return;
         }
-        
+
         showLoading('正在添加Token...');
         try {
             const response = await authFetch('/admin/tokens', {
@@ -546,10 +540,10 @@ async function confirmImportFromModal() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ access_token: accessToken, refresh_token: refreshToken, expires_in: expiresIn })
             });
-            
+
             const data = await response.json();
             hideLoading();
-            
+
             if (data.success) {
                 closeImportModal();
                 showToast('Token添加成功', 'success');
@@ -563,48 +557,49 @@ async function confirmImportFromModal() {
         }
         return;
     }
-    
+
     // 文件上传或JSON导入模式
     if (!pendingImportData) {
         showToast('请先选择文件或解析JSON', 'warning');
         return;
     }
-    
+
     const mode = document.getElementById('importMode').value;
-    const password = document.getElementById('importPassword').value;
-    
-    if (!password) {
-        showToast('请输入管理员密码', 'warning');
-        return;
-    }
-    
-    showLoading('正在导入...');
-    try {
-        const response = await authFetch('/admin/tokens/import', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password, data: pendingImportData, mode })
-        });
-        
-        const data = await response.json();
-        hideLoading();
-        
-        if (data.success) {
-            closeImportModal();
-            showToast(data.message, 'success');
-            loadTokens();
-        } else {
-            // 密码错误时显示具体提示
-            if (response.status === 403) {
-                showToast('密码错误，请重新输入', 'error');
+
+    const result = await withAdminSecret(async (secretKey) => {
+        showLoading('正在导入...');
+        try {
+            const response = await authFetch('/admin/tokens/import', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Secret': secretKey
+                },
+                body: JSON.stringify({ data: pendingImportData, mode })
+            });
+
+            const data = await response.json();
+            hideLoading();
+
+            if (data.success) {
+                closeImportModal();
+                showToast(data.message, 'success');
+                loadTokens();
+                return { success: true };
             } else {
+                if (data.requireAdminSecret) {
+                    throw { message: '管理员密钥验证失败', status: 403 };
+                }
                 showToast(data.message || '导入失败', 'error');
+                return { success: false };
             }
+        } catch (error) {
+            hideLoading();
+            throw error;
         }
-    } catch (error) {
-        hideLoading();
-        showToast('导入失败: ' + error.message, 'error');
-    }
+    }, '导入Token');
+
+    if (result?.cancelled) return;
 }
 
 // 密码输入提示框
@@ -971,58 +966,134 @@ function editField(event, tokenId, field, currentValue) {
     event.stopPropagation();
     const row = event.currentTarget;
     const valueSpan = row.querySelector('.info-value');
-    
+
     if (row.querySelector('input')) return;
-    
+
+    // 如果是邮箱且包含掩码，先尝试获取完整数据
+    if (field === 'email' && (currentValue.includes('****') || currentValue === '点击设置')) {
+        handleSensitiveField(row, tokenId, field, valueSpan);
+        return;
+    }
+
+    startEditing(row, tokenId, field, currentValue, valueSpan);
+}
+
+// 处理敏感字段的查看/编辑
+async function handleSensitiveField(row, tokenId, field, valueSpan) {
+    const result = await withAdminSecret(async (secretKey) => {
+        try {
+            // 这里我们使用 GET /tokens/sensitive 接口或者直接用密钥去获取单个 token 的详情
+            // 简单起见，我们假设可以通过密钥获取完整信息的接口
+            // 由于目前后端 GET /tokens 已经脱敏，我们需要一个新的接口或者在这里直接允许用户输入新的覆盖
+            // 为了更好的体验，我们实现一个获取完整信息的逻辑
+
+            // 使用 /admin/tokens/sensitive 接口获取所有数据然后查找（不够高效但可行）
+            // 或者我们可以修改后端支持用密钥获取单个完整 token
+            // 这里为了简化，我们先尝试获取完整列表找到对应的
+
+            showLoading('获取完整信息...');
+            const response = await authFetch('/admin/tokens/sensitive', {
+                headers: {
+                    'X-Admin-Secret': secretKey
+                }
+            });
+
+            const data = await response.json();
+            hideLoading();
+
+            if (data.success) {
+                const token = data.data.find(t => t.id === tokenId);
+                if (token) {
+                    return { success: true, value: token[field] };
+                }
+            } else {
+                if (data.requireAdminSecret) {
+                    throw { message: '管理员密钥验证失败', status: 403 };
+                }
+            }
+            return { success: false };
+        } catch (error) {
+            hideLoading();
+            throw error;
+        }
+    }, '查看/编辑敏感信息');
+
+    if (result && result.success && result.value !== undefined) {
+        // 获取成功，开始编辑
+        startEditing(row, tokenId, field, result.value, valueSpan);
+    } else if (result && result.cancelled) {
+        // 取消
+    } else {
+        // 获取失败，询问是否直接覆盖
+        const confirm = await showConfirm('无法获取完整信息，是否直接输入新值覆盖？', '无法获取原值');
+        if (confirm) {
+            startEditing(row, tokenId, field, '', valueSpan);
+        }
+    }
+}
+
+function startEditing(row, tokenId, field, currentValue, valueSpan) {
     const fieldLabels = { projectId: 'Project ID', email: '邮箱' };
-    
+
     const input = document.createElement('input');
     input.type = field === 'email' ? 'email' : 'text';
-    input.value = currentValue;
+    input.value = currentValue === '点击设置' ? '' : currentValue;
     input.className = 'inline-edit-input';
     input.placeholder = `输入${fieldLabels[field]}`;
-    
+
     valueSpan.style.display = 'none';
     row.insertBefore(input, valueSpan.nextSibling);
     input.focus();
     input.select();
-    
+
     const save = async () => {
         const newValue = input.value.trim();
         input.disabled = true;
-        
-        try {
-            const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
-                method: 'PUT',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ [field]: newValue })
-            });
-            
-            const data = await response.json();
-            if (data.success) {
-                showToast('已保存', 'success');
-                loadTokens();
-            } else {
-                showToast(data.message || '保存失败', 'error');
+
+        const result = await withAdminSecret(async (secretKey) => {
+            try {
+                const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Secret': secretKey
+                    },
+                    body: JSON.stringify({ [field]: newValue })
+                });
+
+                const data = await response.json();
+                if (data.success) {
+                    showToast('已保存', 'success');
+                    loadTokens();
+                    return { success: true };
+                } else {
+                    if (data.requireAdminSecret) {
+                        throw { message: '管理员密钥验证失败', status: 403 };
+                    }
+                    showToast(data.message || '保存失败', 'error');
+                    cancel();
+                    return { success: false };
+                }
+            } catch (error) {
+                showToast('保存失败: ' + error.message, 'error');
                 cancel();
+                throw error;
             }
-        } catch (error) {
-            showToast('保存失败', 'error');
-            cancel();
-        }
+        }, '修改Token信息');
+
+        if (result?.cancelled) cancel();
     };
-    
+
     const cancel = () => {
         input.remove();
         valueSpan.style.display = '';
     };
-    
+
+    // ... 事件监听代码复用 ...
     input.addEventListener('blur', () => {
         setTimeout(() => {
             if (document.activeElement !== input) {
-                if (input.value.trim() !== currentValue) {
+                if (input.value.trim() !== (currentValue === '点击设置' ? '' : currentValue)) {
                     save();
                 } else {
                     cancel();
@@ -1030,7 +1101,7 @@ function editField(event, tokenId, field, currentValue) {
             }
         }, 100);
     });
-    
+
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
             e.preventDefault();
@@ -1088,82 +1159,116 @@ function showTokenDetail(tokenId) {
 async function saveTokenDetail(tokenId) {
     const projectId = document.getElementById('editProjectId').value.trim();
     const email = document.getElementById('editEmail').value.trim();
-    
-    showLoading('保存中...');
-    try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ projectId, email })
-        });
-        
-        const data = await response.json();
-        hideLoading();
-        if (data.success) {
-            document.querySelector('.form-modal').remove();
-            showToast('保存成功', 'success');
-            loadTokens();
-        } else {
-            showToast(data.message || '保存失败', 'error');
+
+    const result = await withAdminSecret(async (secretKey) => {
+        showLoading('保存中...');
+        try {
+            const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Secret': secretKey
+                },
+                body: JSON.stringify({ projectId, email })
+            });
+
+            const data = await response.json();
+            hideLoading();
+            if (data.success) {
+                document.querySelector('.form-modal').remove();
+                showToast('保存成功', 'success');
+                loadTokens();
+                return { success: true };
+            } else {
+                if (data.requireAdminSecret) {
+                    throw { message: '管理员密钥验证失败', status: 403 };
+                }
+                showToast(data.message || '保存失败', 'error');
+                return { success: false };
+            }
+        } catch (error) {
+            hideLoading();
+            throw error;
         }
-    } catch (error) {
-        hideLoading();
-        showToast('保存失败: ' + error.message, 'error');
-    }
+    }, '保存Token详情');
+
+    if (result?.cancelled) return;
 }
 
 async function toggleToken(tokenId, enable) {
     const action = enable ? '启用' : '禁用';
     const confirmed = await showConfirm(`确定要${action}这个Token吗？`, `${action}确认`);
     if (!confirmed) return;
-    
-    showLoading(`正在${action}...`);
-    try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ enable })
-        });
-        
-        const data = await response.json();
-        hideLoading();
-        if (data.success) {
-            showToast(`已${action}`, 'success');
-            skipAnimation = true; // 跳过动画
-            loadTokens();
-        } else {
-            showToast(data.message || '操作失败', 'error');
+
+    // 启用/禁用操作均需要管理员密钥验证
+    const result = await withAdminSecret(async (secretKey) => {
+        showLoading(`正在${action}...`);
+        try {
+            const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Secret': secretKey
+                },
+                body: JSON.stringify({ enable })
+            });
+
+            const data = await response.json();
+            hideLoading();
+            if (data.success) {
+                showToast(`已${action}`, 'success');
+                skipAnimation = true;
+                loadTokens();
+                return { success: true };
+            } else {
+                if (data.requireAdminSecret) {
+                    throw { message: '管理员密钥验证失败', status: 403 };
+                }
+                showToast(data.message || '操作失败', 'error');
+                return { success: false };
+            }
+        } catch (error) {
+            hideLoading();
+            throw error;
         }
-    } catch (error) {
-        hideLoading();
-        showToast('操作失败: ' + error.message, 'error');
-    }
+    }, `${action}Token`);
+
+    if (result?.cancelled) return;
 }
 
 async function deleteToken(tokenId) {
     const confirmed = await showConfirm('删除后无法恢复，确定删除？', '⚠️ 删除确认');
     if (!confirmed) return;
-    
-    showLoading('正在删除...');
-    try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
-            method: 'DELETE'
-        });
-        
-        const data = await response.json();
-        hideLoading();
-        if (data.success) {
-            showToast('已删除', 'success');
-            loadTokens();
-        } else {
-            showToast(data.message || '删除失败', 'error');
+
+    // 需要管理员密钥验证
+    const result = await withAdminSecret(async (secretKey) => {
+        showLoading('正在删除...');
+        try {
+            const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
+                method: 'DELETE',
+                headers: {
+                    'X-Admin-Secret': secretKey
+                }
+            });
+
+            const data = await response.json();
+            hideLoading();
+            if (data.success) {
+                showToast('已删除', 'success');
+                loadTokens();
+                return { success: true };
+            } else {
+                if (data.requireAdminSecret) {
+                    throw { message: '管理员密钥验证失败', status: 403 };
+                }
+                showToast(data.message || '删除失败', 'error');
+                return { success: false };
+            }
+        } catch (error) {
+            hideLoading();
+            throw error;
         }
-    } catch (error) {
-        hideLoading();
-        showToast('删除失败: ' + error.message, 'error');
-    }
+    }, '删除Token');
+
+    if (result?.cancelled) return;
 }

@@ -308,10 +308,14 @@ export const withEmptyRetry = async (fn, maxRetries, loggerPrefix = '', options 
   const retries = Number.isFinite(maxRetries) && maxRetries > 0 ? Math.floor(maxRetries) : 0;
   let attempt = 0;
   let currentToken = options.currentToken || null;
+  let lastResult = null;
+  let lastError = null;
 
   while (attempt <= retries) {
     try {
       const result = await fn(attempt, currentToken);
+      lastResult = result;
+      lastError = null;
 
       // 检测空回：没有内容、没有工具调用、没有思考内容
       const isEmpty = !result.hasContent && !result.hasToolCalls && !result.hasReasoning;
@@ -341,11 +345,17 @@ export const withEmptyRetry = async (fn, maxRetries, loggerPrefix = '', options 
         continue;
       }
 
+      // 成功且非空，或已达到最大重试次数
       return result;
     } catch (error) {
+      lastError = error;
+      lastResult = null;
+
       // 429 等错误：尝试重试
       const status = Number(error.status || error.statusCode || error.response?.status);
-      if ((status === 429 || status === 503 || status === 529) && attempt < retries) {
+      const isRetryableError = status === 429 || status === 503 || status === 529;
+
+      if (isRetryableError && attempt < retries) {
         const nextAttempt = attempt + 1;
         const explicitDelayMs = getUpstreamRetryDelayMs(error);
         const waitMs = computeBackoffMs(nextAttempt, explicitDelayMs);
@@ -370,7 +380,15 @@ export const withEmptyRetry = async (fn, maxRetries, loggerPrefix = '', options 
 
         continue;
       }
+
+      // 非可重试错误，或已达到最大重试次数
       throw error;
     }
   }
+
+  // 循环结束（理论上不应该到这里，但作为保险）
+  if (lastError) {
+    throw lastError;
+  }
+  return lastResult;
 };

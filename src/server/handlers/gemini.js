@@ -14,7 +14,8 @@ import {
   createHeartbeat,
   writeStreamData,
   endStream,
-  with429Retry
+  with429Retry,
+  withEmptyRetry
 } from '../stream.js';
 
 /**
@@ -221,32 +222,59 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
         let usageData = null;
         let hasToolCall = false;
 
-        await with429Retry(
-          (attempt, currentToken) => {
+        // 【改进】使用延迟写入策略 + withEmptyRetry 包装
+        const emptyRetries = Math.max(safeRetries, 3);
+        let collectedChunks = [];
+        let hasContent = false;
+        let hasReasoning = false;
+
+        await withEmptyRetry(
+          async (attempt, currentToken) => {
+            // 每次重试前重置状态
+            usageData = null;
+            hasToolCall = false;
+            collectedChunks = [];
+            hasContent = false;
+            hasReasoning = false;
+
+            if (attempt > 0) {
+              logger.info(`gemini.stream 空回/错误重试第 ${attempt} 次`);
+            }
+
             const body = attempt > 0 ? createRequestBody(currentToken) : requestBody;
-            return generateAssistantResponse(body, currentToken || token, (data) => {
+            await generateAssistantResponse(body, currentToken || token, (data) => {
               if (data.type === 'usage') {
                 usageData = data.usage;
               } else if (data.type === 'reasoning') {
-                // Gemini 思考内容
+                hasReasoning = true;
                 const chunk = createGeminiResponse(null, data.reasoning_content, data.thoughtSignature, null, null, null);
-                writeStreamData(res, chunk);
+                collectedChunks.push(chunk);
               } else if (data.type === 'tool_calls') {
                 hasToolCall = true;
-                // Gemini 工具调用
                 const chunk = createGeminiResponse(null, null, null, data.tool_calls, null, null);
-                writeStreamData(res, chunk);
+                collectedChunks.push(chunk);
               } else {
-                // 普通文本
+                hasContent = true;
                 const chunk = createGeminiResponse(data.content, null, null, null, null, null);
-                writeStreamData(res, chunk);
+                collectedChunks.push(chunk);
               }
             });
+
+            return {
+              hasContent,
+              hasToolCalls: hasToolCall,
+              hasReasoning
+            };
           },
-          safeRetries,
+          emptyRetries,
           'gemini.stream ',
           retryOptions
         );
+
+        // 【成功后】批量写入
+        for (const chunk of collectedChunks) {
+          writeStreamData(res, chunk);
+        }
 
         // 发送结束块和 usage
         const finishReason = hasToolCall ? "STOP" : "STOP"; // Gemini 工具调用也是 STOP

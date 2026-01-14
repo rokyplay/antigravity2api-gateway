@@ -226,3 +226,161 @@ function restoreTabState() {
     }
 }
 
+// ==================== 管理员密钥验证 ====================
+// 存储管理员密钥（会话级别，不持久化）
+let cachedAdminSecretKey = null;
+
+/**
+ * 获取管理员密钥（如果已缓存则直接返回）
+ * @returns {string|null}
+ */
+function getCachedAdminSecret() {
+    return cachedAdminSecretKey;
+}
+
+/**
+ * 清除缓存的管理员密钥
+ */
+function clearAdminSecretCache() {
+    cachedAdminSecretKey = null;
+}
+
+/**
+ * 显示管理员密钥输入弹窗
+ * @param {string} action - 操作描述（如："删除Token"、"导出数据"）
+ * @returns {Promise<string|null>} - 返回输入的密钥，取消返回 null
+ */
+function requestAdminSecret(action = '执行敏感操作') {
+    return new Promise((resolve) => {
+        // 如果已有缓存的密钥，直接返回
+        if (cachedAdminSecretKey) {
+            resolve(cachedAdminSecretKey);
+            return;
+        }
+
+        const modal = document.createElement('div');
+        modal.className = 'modal';
+        const safeAction = escapeHtml(action);
+        modal.innerHTML = `
+            <div class="modal-content" style="max-width: 400px;">
+                <div class="modal-title">🔐 管理员密钥验证</div>
+                <div class="modal-message" style="margin-bottom: 15px;">
+                    ${safeAction} 需要验证管理员密钥
+                </div>
+                <div class="form-group" style="margin-bottom: 15px;">
+                    <input type="password" id="adminSecretInput" class="input"
+                           placeholder="请输入管理员密钥"
+                           style="width: 100%; padding: 10px; font-family: monospace;">
+                </div>
+                <div style="margin-bottom: 15px;">
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px;">
+                        <input type="checkbox" id="rememberSecretCheckbox">
+                        <span>本次会话记住密钥</span>
+                    </label>
+                </div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="secretCancelBtn">取消</button>
+                    <button class="btn btn-primary" id="secretOkBtn">验证</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+
+        const input = modal.querySelector('#adminSecretInput');
+        const checkbox = modal.querySelector('#rememberSecretCheckbox');
+        const cancelBtn = modal.querySelector('#secretCancelBtn');
+        const okBtn = modal.querySelector('#secretOkBtn');
+
+        // 自动聚焦输入框
+        setTimeout(() => input.focus(), 100);
+
+        const cleanup = () => {
+            cancelBtn.removeEventListener('click', handleCancel);
+            okBtn.removeEventListener('click', handleOk);
+            input.removeEventListener('keydown', handleKeydown);
+            modal.removeEventListener('click', handleModalClick);
+            modal.remove();
+        };
+
+        const handleCancel = () => {
+            cleanup();
+            resolve(null);
+        };
+
+        const handleOk = () => {
+            const secretKey = input.value.trim();
+            if (!secretKey) {
+                showToast('请输入管理员密钥', 'warning');
+                input.focus();
+                return;
+            }
+            // 如果勾选了记住，缓存密钥
+            if (checkbox.checked) {
+                cachedAdminSecretKey = secretKey;
+            }
+            cleanup();
+            resolve(secretKey);
+        };
+
+        const handleKeydown = (e) => {
+            if (e.key === 'Enter') {
+                handleOk();
+            } else if (e.key === 'Escape') {
+                handleCancel();
+            }
+        };
+
+        const handleModalClick = (e) => {
+            if (e.target === modal) {
+                handleCancel();
+            }
+        };
+
+        cancelBtn.addEventListener('click', handleCancel);
+        okBtn.addEventListener('click', handleOk);
+        input.addEventListener('keydown', handleKeydown);
+        modal.addEventListener('click', handleModalClick);
+    });
+}
+
+/**
+ * 包装需要管理员密钥的请求
+ * @param {Function} requestFn - 请求函数，接收 secretKey 参数
+ * @param {string} action - 操作描述
+ * @returns {Promise<any>}
+ */
+async function withAdminSecret(requestFn, action = '执行操作') {
+    // 第一次尝试（尝试获取密钥，可能是缓存的）
+    let secretKey = await requestAdminSecret(action);
+    if (!secretKey) {
+        return { cancelled: true };
+    }
+
+    try {
+        const result = await requestFn(secretKey);
+        return result;
+    } catch (error) {
+        // 如果是密钥验证失败（403 或特定消息），清除缓存并允许重试
+        if (error.message?.includes('管理员密钥') || error.status === 403) {
+
+            // 如果是因为使用了缓存的错误密钥，我们清除缓存并告诉用户
+            if (cachedAdminSecretKey) {
+                // 如果是缓存的密钥错了，清除缓存，自动重试一次输入
+                clearAdminSecretCache();
+
+                // 提示用户密钥错误，请重试
+                showToast('密钥无效，请重新输入', 'warning');
+
+                // 递归调用自身，因为 requestAdminSecret 现在不会使用缓存了，会弹窗
+                return withAdminSecret(requestFn, action);
+            } else {
+                 // 如果是刚输入的就错了，也允许重试
+                 clearAdminSecretCache();
+                 showToast('密钥错误，请重新输入', 'error');
+                 return withAdminSecret(requestFn, action);
+            }
+        }
+        throw error;
+    }
+}
+

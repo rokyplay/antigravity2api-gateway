@@ -140,6 +140,10 @@ export const handleOpenAIRequest = async (req, res) => {
           // 【空回重试】使用 withEmptyRetry 包装整个流式请求
           const emptyRetries = Math.max(safeRetries, 3); // 空回至少重试 3 次
 
+          // 【改进】使用延迟写入策略：先收集所有数据，确认成功后再写入响应
+          // 这样在 429 或其他可重试错误发生时，可以真正重试而不是返回部分数据
+          let collectedChunks = []; // 收集待写入的 chunk
+
           await withEmptyRetry(
             async (attempt, currentToken) => {
               // 每次重试前重置收集状态
@@ -148,6 +152,7 @@ export const handleOpenAIRequest = async (req, res) => {
               collectedToolCalls = [];
               collectedContent = '';
               hasReasoning = false;
+              collectedChunks = []; // 重试时清空已收集的 chunk
 
               if (attempt > 0) {
                 logger.info(`chat.stream 空回/错误重试第 ${attempt} 次`);
@@ -163,7 +168,8 @@ export const handleOpenAIRequest = async (req, res) => {
                   if (data.thoughtSignature && config.passSignatureToClient) {
                     delta.thoughtSignature = data.thoughtSignature;
                   }
-                  writeStreamData(res, createStreamChunk(id, created, model, delta));
+                  // 延迟写入：先收集
+                  collectedChunks.push(createStreamChunk(id, created, model, delta));
                 } else if (data.type === 'tool_calls') {
                   hasToolCall = true;
                   collectedToolCalls = data.tool_calls; // 收集工具调用
@@ -177,11 +183,13 @@ export const handleOpenAIRequest = async (req, res) => {
                     }
                   });
                   const delta = { tool_calls: toolCallsWithIndex };
-                  writeStreamData(res, createStreamChunk(id, created, model, delta));
+                  // 延迟写入：先收集
+                  collectedChunks.push(createStreamChunk(id, created, model, delta));
                 } else {
                   collectedContent += data.content || '';
                   const delta = { content: data.content };
-                  writeStreamData(res, createStreamChunk(id, created, model, delta));
+                  // 延迟写入：先收集
+                  collectedChunks.push(createStreamChunk(id, created, model, delta));
                 }
               });
 
@@ -196,6 +204,11 @@ export const handleOpenAIRequest = async (req, res) => {
             'chat.stream ',
             retryOptions
           );
+
+          // 【成功后】批量写入所有收集的 chunk
+          for (const chunk of collectedChunks) {
+            writeStreamData(res, chunk);
+          }
 
           // 【WebSearch 流式处理】检测是否有 WebSearch 工具调用
           const webSearchCall = findWebSearchCall(collectedToolCalls);
